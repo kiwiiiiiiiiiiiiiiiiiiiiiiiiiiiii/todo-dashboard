@@ -1,0 +1,15 @@
+node_modules/
+.next/
+
+# logs
+*.log
+
+# secrets
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# binaries and build junk
+*.exe
+*.tsbuildinfo
