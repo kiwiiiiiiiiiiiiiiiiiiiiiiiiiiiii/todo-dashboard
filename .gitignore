@@ -1,6 +1,9 @@
 node_modules/
 .next/
 
+# supabase local stack
+supabase/.temp/
+
 # logs
 *.log
 
