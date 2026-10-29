@@ -1,7 +1,10 @@
 import { streamText, type CoreMessage } from "ai"
 import { createOpenAI } from "@ai-sdk/openai"
+import type { SupabaseClient } from "@supabase/supabase-js"
 import { createServerClient } from "@/lib/supabase/server"
 import { resolveModelConfig } from "@/lib/ai/model"
+import type { Database } from "@/lib/supabase/types"
+import { chatRequestSchema, MAX_CHAT_TURNS } from "@/lib/chat/schema"
 
 // System persona for the accountability coach
 const SYSTEM_PROMPT = `You are the accountability coach embedded in the user's personal dashboard.
@@ -13,14 +16,13 @@ Rules:
 - For medical or safety topics give a one-line practical caution, not a lecture.
 `
 
+// Free-tier friendly budget: enough for a burst of coaching, cheap to enforce.
+const RATE_LIMIT_MAX = 20
+const RATE_LIMIT_WINDOW_SECONDS = 600
+
 export const runtime = "nodejs"
 
-interface ChatMessage {
-  role: string
-  content: string
-}
-
-async function gatherContext(supabase: any, userId: string): Promise<string> {
+async function gatherContext(supabase: SupabaseClient<Database>): Promise<string> {
   const lines: string[] = []
   const now = Date.now()
   const daysAgoIso = (days: number) =>
@@ -50,10 +52,10 @@ async function gatherContext(supabase: any, userId: string): Promise<string> {
       : null
     lines.push(`- ${t.title} [${t.status}]${daysLeft !== null ? ` — ${daysLeft}d to deadline` : ""}`)
   }
-  const done = projects.filter((p: any) => p.status === "done").length
+  const done = projects.filter((p) => p.status === "done").length
   lines.push(`- Projects completed so far: ${done}`)
 
-  const weekMinutes = workouts.reduce((s: number, w: any) => s + Number(w.duration_minutes || 0), 0)
+  const weekMinutes = workouts.reduce((s, w) => s + Number(w.duration_minutes ?? 0), 0)
   lines.push("FITNESS (last 7 days):")
   lines.push(`- Workouts: ${workouts.length} sessions, ${weekMinutes} minutes total`)
   if (weights.length > 0) {
@@ -76,56 +78,89 @@ async function gatherContext(supabase: any, userId: string): Promise<string> {
   return lines.join("\n")
 }
 
+function errorResponse(status: number, error: string, headers?: HeadersInit) {
+  return Response.json({ error }, { status, headers })
+}
+
 export async function POST(req: Request) {
-  const { apiKey, baseURL, modelId } = resolveModelConfig()
-  if (!apiKey) {
-    return Response.json(
-      { error: "AI_API_KEY (or OPENAI_API_KEY) is not set. Add it to .env and restart the dev server." },
-      { status: 401 }
-    )
-  }
-
-  const body = await req.json()
-  const messages = (body?.messages ?? []) as ChatMessage[]
-  // Trim history: only the most recent turns go to the model. Unbounded
-  // history inflates token cost and eventually trips free-tier rate limits.
-  // Also drop any client-supplied "system" roles (firewall our own prompt).
-  const recentMessages = messages
-    .filter((m) => m.role === "user" || m.role === "assistant")
-    .slice(-12)
-  const timezone = typeof body?.timezone === "string" ? body.timezone : undefined
-
-  const supabase = createServerClient()
-  const { data: userData } = await supabase.auth.getUser()
-  if (!userData?.user) {
-    return Response.json(
-      { error: "Sign in first — use the magic-link form in the Cyber-Skill Matrix panel." },
-      { status: 401 }
-    )
-  }
-
-  const context = await gatherContext(supabase, userData.user.id)
-  const system = [
-    SYSTEM_PROMPT,
-    `Today is ${new Date().toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric", year: "numeric", timeZone: timezone })}.`,
-    "Live database snapshot:",
-    context,
-  ].join("\n\n")
-
   try {
-    const client = createOpenAI({ apiKey, baseURL: baseURL as string | undefined })
-    const result = await streamText({
-      model: client(modelId),
-      system,
-      messages: recentMessages as unknown as CoreMessage[],
-      // Transient provider overload (503) is retried with backoff by the SDK.
-      maxRetries: 4,
+    const { apiKey, baseURL, modelId } = resolveModelConfig()
+    // A missing key is a server fault, not an auth challenge.
+    if (!apiKey) {
+      return errorResponse(500, "Server misconfigured: AI_API_KEY (or OPENAI_API_KEY) is not set.")
+    }
+
+    let raw: unknown
+    try {
+      raw = await req.json()
+    } catch {
+      return errorResponse(400, "Request body must be valid JSON.")
+    }
+
+    // Validate before touching auth or the database: cheap, and rejects
+    // oversized payloads, empty messages and client-supplied system roles.
+    const parsed = chatRequestSchema.safeParse(raw)
+    if (!parsed.success) {
+      return Response.json(
+        { error: "Invalid request body.", issues: parsed.error.flatten().fieldErrors },
+        { status: 400 }
+      )
+    }
+
+    const supabase = createServerClient()
+    const { data: userData, error: authError } = await supabase.auth.getUser()
+    if (authError || !userData?.user) {
+      return errorResponse(401, "Sign in first — use the magic-link form in the Cyber-Skill Matrix panel.")
+    }
+
+    // Per-user budget, enforced in one atomic statement before the expensive
+    // snapshot queries and the model call.
+    const { data: limitRows, error: limitError } = await supabase.rpc("check_chat_rate_limit", {
+      p_limit: RATE_LIMIT_MAX,
+      p_window_seconds: RATE_LIMIT_WINDOW_SECONDS,
     })
-    return result.toDataStreamResponse()
-  } catch (err: any) {
-    return Response.json(
-      { error: err?.message || "Coach streaming failed" },
-      { status: 500 }
-    )
+    if (limitError) {
+      console.error("rate limit check failed:", limitError.message)
+      return errorResponse(503, "Rate limiter unavailable. Try again shortly.")
+    }
+    const limit = limitRows?.[0]
+    if (limit && !limit.allowed) {
+      return Response.json(
+        {
+          error: `Rate limit reached (${RATE_LIMIT_MAX} messages per ${RATE_LIMIT_WINDOW_SECONDS / 60} minutes). Try again later.`,
+        },
+        { status: 429, headers: { "Retry-After": String(limit.retry_after_seconds) } }
+      )
+    }
+
+    const messages = parsed.data.messages.slice(-MAX_CHAT_TURNS)
+    const timezone = parsed.data.timezone
+
+    const context = await gatherContext(supabase)
+    const system = [
+      SYSTEM_PROMPT,
+      `Today is ${new Date().toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric", year: "numeric", timeZone: timezone })}.`,
+      "Live database snapshot:",
+      context,
+    ].join("\n\n")
+
+    try {
+      const client = createOpenAI({ apiKey, baseURL })
+      const result = await streamText({
+        model: client(modelId),
+        system,
+        messages: messages as CoreMessage[],
+        // Transient provider overload (503) is retried with backoff by the SDK.
+        maxRetries: 4,
+      })
+      return result.toDataStreamResponse()
+    } catch (err) {
+      console.error("coach stream failed:", err instanceof Error ? err.message : err)
+      // Upstream provider failure is a bad gateway, not our bug.
+      return errorResponse(502, "The AI provider failed to respond. Try again.")
+    }
+  } catch (err) {
+    console.error("chat route failed:", err instanceof Error ? err.message : err)
+    return errorResponse(500, "Unexpected server error.")
   }
 }
