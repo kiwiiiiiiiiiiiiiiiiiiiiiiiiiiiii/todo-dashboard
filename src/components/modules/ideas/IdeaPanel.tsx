@@ -8,7 +8,7 @@ import { getBrowserClient } from "@/lib/supabase/client"
 interface Idea {
   id: string
   content: string
-  created_at: string
+  created_at: string | null
 }
 
 // Quick idea capture: one input, newest-first list, delete button.
@@ -143,10 +143,12 @@ export function IdeaPanel() {
               {ideas.map((idea) => (
                 <li key={idea.id} className="group flex items-start gap-2 text-xs">
                   <span className="w-14 shrink-0 font-mono-tabular text-[10px] text-muted-foreground pt-0.5">
-                    {new Date(idea.created_at).toLocaleDateString("en-US", {
-                      month: "short",
-                      day: "numeric",
-                    })}
+                    {idea.created_at
+                      ? new Date(idea.created_at).toLocaleDateString("en-US", {
+                          month: "short",
+                          day: "numeric",
+                        })
+                      : ""}
                   </span>
                   <span className="flex-1 break-words">{idea.content}</span>
                   <button

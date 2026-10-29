@@ -19,8 +19,8 @@ interface Project {
   description: string | null
   status: string
   is_blocking: boolean
-  created_at: string
-  updated_at: string
+  created_at: string | null
+  updated_at: string | null
 }
 
 interface WipTask {
@@ -290,6 +290,9 @@ export function ProjectPurgatory() {
           <div className="space-y-2">
             {activeProjects.map((project) => {
               const task = findActiveTask(project.id)
+              // created_at is nullable in the generated types; the column has a
+              // default, so falling back to "now" is safe and keeps the timer typed.
+              const createdAt = project.created_at ?? new Date().toISOString()
               return (
                 <div
                   key={project.id}
@@ -304,7 +307,7 @@ export function ProjectPurgatory() {
                         </span>
                       )}
                     </div>
-                    <CountdownTimer deadline={task?.deadline || project.created_at} />
+                    <CountdownTimer deadline={task?.deadline || createdAt} />
                   </div>
                   {project.description && (
                     <p className="text-[11px] text-muted-foreground mt-1 truncate">
@@ -313,7 +316,7 @@ export function ProjectPurgatory() {
                   )}
                   <div className="flex items-center justify-between pt-2 mt-2 border-t border-border/50">
                     <span className="text-xs font-mono-tabular text-muted-foreground">
-                      {calculateDaysRemaining(task?.deadline || project.created_at)}d left
+                      {calculateDaysRemaining(task?.deadline || createdAt)}d left
                     </span>
                     <div className="flex items-center gap-2">
                       {confirmDeleteId === project.id ? (
@@ -388,10 +391,12 @@ export function ProjectPurgatory() {
                   <CheckCircle className="w-3 h-3 shrink-0 text-muted-foreground/50" />
                   <span className="truncate">{p.title}</span>
                   <span className="ml-auto shrink-0 font-mono-tabular text-[10px] text-muted-foreground">
-                    {new Date(p.updated_at).toLocaleDateString("en-US", {
-                      month: "short",
-                      day: "numeric",
-                    })}
+                    {p.updated_at
+                      ? new Date(p.updated_at).toLocaleDateString("en-US", {
+                          month: "short",
+                          day: "numeric",
+                        })
+                      : ""}
                   </span>
                 </li>
               ))}
